@@ -598,16 +598,31 @@ void setup() {
   // ... and what is the temperature and humdidity offset we should use
   reported_temperature_offset_degC = eeprom_read_float((float *) EEPROM_TEMPERATURE_OFFSET);
   reported_humidity_offset_percent = eeprom_read_float((float *) EEPROM_HUMIDITY_OFFSET);
+
+  // Scan Networks to show RSSI    
+  uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);    
+  if(connect_method != CONNECT_METHOD_SMARTCONFIG){
+    displayRSSI(); // not sure this will work if Smart Config is used
+  }
+    
+  delayForWatchdog();
+  petWatchdog();
+  restartWifi();
+  delayForWatchdog();
+  petWatchdog();
+
+  // set Time from NTP
+  Serial.println(F("Get time from NTP"));
+  unsigned long gt = getTimeFromNTP() ;
+  Serial.println(F("Set time from NTP"));
+  setTime(gt);
+  Serial.println(F("Time set from NTP"));
+
+  delayForWatchdog();
+  petWatchdog();
+
   
   if(mode_requires_wifi(mode)){
-    // Scan Networks to show RSSI    
-    uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);    
-    if(connect_method != CONNECT_METHOD_SMARTCONFIG){
-      displayRSSI(); // not sure this will work if Smart Config is used
-    }
-    
-    delayForWatchdog();
-    petWatchdog();
     
     // Try and Connect to the Configured Network
     if(!restartWifi()){
@@ -627,6 +642,7 @@ void setup() {
     // if it's different from what's already there
     // importantly this check only happens at startup    
     commitConfigToMirroredConfig();
+
   
     // Check for Firmware Updates 
     checkForFirmwareUpdates();
@@ -641,6 +657,9 @@ void setup() {
         petWatchdog();
       }      
     }
+
+    delayForWatchdog() ;
+    petWatchdog();
     
     // Connect to MQTT server
     if(!mqttReconnect()){
@@ -750,7 +769,7 @@ void initializeHardware(void) {
 
   Serial.println(F(" +------------------------------------+"));
   Serial.println(F(" |   Welcome to Air Quality Egg 2.0   |"));
-  Serial.println(F(" |       NO2 / CO Sensor Suite        |"));  
+  Serial.println(F(" |       NO2 / CO Sensor Suite / CC3000 FW and wait / 20:10 |"));  
   Serial.print(F(" |       Firmware Version "));
   Serial.print(firmware_version);
   Serial.println(F("       |"));
@@ -949,6 +968,15 @@ void initializeHardware(void) {
 
   uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);
   Serial.print(F("Info: CC3000 Initialization..."));  
+
+  // try to display firmware version of CC3000. Gives back 0.0
+  uint8_t major=0 ;
+  uint8_t minor=0 ;
+  cc3000.getFirmwareVersion(&major, &minor);
+  char tmp2[17] = {0};
+  snprintf(tmp2, 16, "CC3000FW %d.%d", major,  minor);
+  updateLCD(tmp2, 1);
+
   SUCCESS_MESSAGE_DELAY(); // don't race past the splash screen, and give watchdog some breathing room
   petWatchdog();
   if(connect_method == CONNECT_METHOD_SMARTCONFIG){
@@ -4091,6 +4119,20 @@ uint8_t rssi_to_bars(int8_t rssi_dbm){
   return num_bars;
 }
 
+// cc3000 sometimes fails to hold connection. reconnect if necessary
+//uint16_t getHostByName(const char *hostname, uint32_t *ip) {
+void preGetHostByName() {
+  Serial.print(F("cc3000.getStatus is "));
+  Serial.print(cc3000.getStatus());
+  Serial.println(F(" ( 0=disconnected, 1=scanning, 2=connecting, 3=connected)"));
+  if(!connectedToNetwork()){     
+    Serial.println(F("getHostByName causes restartWifi"));   
+    restartWifi();
+  }
+  delayForWatchdog();
+  petWatchdog();    
+}
+
 boolean restartWifi(){    
   if(!connectedToNetwork()){        
     delayForWatchdog();
@@ -4330,7 +4372,7 @@ boolean mqttResolve(void){
     setLCD_P(PSTR("   RESOLVING"));
     updateLCD("MQTT SERVER", 1);
     SUCCESS_MESSAGE_DELAY();
-    
+    preGetHostByName() ;
     if  (!cc3000.getHostByName(mqtt_server_name, &ip) || (ip == 0))  {
       Serial.print(F("Error: Couldn't resolve '"));
       Serial.print(mqtt_server_name);
@@ -5507,6 +5549,7 @@ boolean updateServerResolve(void){
       updateLCD("UPDATE SERVER", 1);
       SUCCESS_MESSAGE_DELAY();
       
+      preGetHostByName() ;
       if  (!cc3000.getHostByName(update_server_name, &update_server_ip32) || (update_server_ip32 == 0)){
         Serial.print(F("Error: Couldn't resolve '"));
         Serial.print(update_server_name);
@@ -5835,3 +5878,69 @@ void dump_config(uint8_t * buf){
   }
 }
 */
+
+
+/* https://github.com/adafruit/Adafruit_CC3000_Library/blob/master/examples/InternetTime/InternetTime.ino */
+// Minimalist time server query; adapted from Adafruit Gutenbird sketch,
+// which in turn has roots in Arduino UdpNTPClient tutorial.
+unsigned long getTimeFromNTP(void) {
+
+  const unsigned long
+  connectTimeout  = 30L * 1000L, // Max time to wait for server connection
+  responseTimeout = 30L * 1000L; // Max time to wait for data from server
+
+  uint8_t       buf[48];
+  unsigned long startTime, t = 0L;
+  uint32_t ip = 0;
+
+  Serial.print(F("Locating time server..."));
+
+  // Hostname to IP lookup; use NTP pool (rotates through servers)
+  preGetHostByName() ;
+  if(cc3000.getHostByName("nl.pool.ntp.org", &ip)) {
+    static const char PROGMEM
+      timeReqA[] = { 227,  0,  6, 236 },
+      timeReqB[] = {  49, 78, 49,  52 };
+
+    Serial.print(F("\r\nAttempting connection to timeserver "));
+    cc3000.printIPdotsRev(ip); Serial.println();
+    
+    startTime = millis();
+    do {
+      wifiClient = cc3000.connectUDP(ip, 123);
+    } while((!wifiClient.connected()) &&
+            ((millis() - startTime) < connectTimeout));
+
+    if(wifiClient.connected()) {
+      Serial.print(F("connected!\r\nIssuing request..."));
+
+      // Assemble and issue request packet
+      memset(buf, 0, sizeof(buf));
+      memcpy_P( buf    , timeReqA, sizeof(timeReqA));
+      memcpy_P(&buf[12], timeReqB, sizeof(timeReqB));
+      wifiClient.write(buf, sizeof(buf));
+
+      Serial.print(F("\r\nAwaiting response..."));
+      memset(buf, 0, sizeof(buf));
+      startTime = millis();
+      while((!wifiClient.available()) &&
+            ((millis() - startTime) < responseTimeout));
+      Serial.print(F("NTP request took "));
+      Serial.print((  millis() - startTime) / 1000);
+      Serial.println(F(" seconds"));
+      if(wifiClient.available()) {
+        wifiClient.read(buf, sizeof(buf));
+        t = (((unsigned long)buf[40] << 24) |
+             ((unsigned long)buf[41] << 16) |
+             ((unsigned long)buf[42] <<  8) |
+              (unsigned long)buf[43]) - 2208988800UL;
+        Serial.print(F("OK\r\n"));
+      }
+      wifiClient.close();
+    }
+  }
+  if(!t) Serial.println(F("error"));
+  return t;
+}
+
+
